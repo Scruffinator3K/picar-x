@@ -2,6 +2,8 @@ from robot_hat import Pin, ADC, PWM, Servo, fileDB
 from robot_hat import Grayscale_Module, Ultrasonic, utils
 import time
 import os
+from .logging_setup import init_logger
+from .sensors import SafeUltrasonic, SafeGrayscale
 
 
 def constrain(x, min_val, max_val):
@@ -40,25 +42,41 @@ class Picarx(object):
                 config:str=CONFIG,
                 ):
 
-        # reset robot_hat
-        utils.reset_mcu()
-        time.sleep(0.2)
+        # logger
+        self.log = init_logger("picarx")
+
+        # reset robot_hat with guard
+        try:
+            utils.reset_mcu()
+            time.sleep(0.2)
+        except Exception as e:
+            # Continue but log, allows running in dev environments without hardware
+            self.log.warning(f"MCU reset failed or not available: {e}")
 
         # --------- config_flie ---------
-        self.config_flie = fileDB(config, 777, os.getlogin())
+        try:
+            self.config_flie = fileDB(config, 777, os.getlogin())
+        except Exception:
+            # fallback to user config under home dir when /opt path not writable
+            home_conf = os.path.join(os.path.expanduser("~"), ".picarx.conf")
+            self.config_flie = fileDB(home_conf, 777, os.getlogin())
+            self.log.info(f"Using fallback config at {home_conf}")
 
         # --------- servos init ---------
         self.cam_pan = Servo(servo_pins[0])
-        self.cam_tilt = Servo(servo_pins[1])   
+        self.cam_tilt = Servo(servo_pins[1])
         self.dir_servo_pin = Servo(servo_pins[2])
         # get calibration values
         self.dir_cali_val = float(self.config_flie.get("picarx_dir_servo", default_value=0))
         self.cam_pan_cali_val = float(self.config_flie.get("picarx_cam_pan_servo", default_value=0))
         self.cam_tilt_cali_val = float(self.config_flie.get("picarx_cam_tilt_servo", default_value=0))
         # set servos to init angle
-        self.dir_servo_pin.angle(self.dir_cali_val)
-        self.cam_pan.angle(self.cam_pan_cali_val)
-        self.cam_tilt.angle(self.cam_tilt_cali_val)
+        try:
+            self.dir_servo_pin.angle(self.dir_cali_val)
+            self.cam_pan.angle(self.cam_pan_cali_val)
+            self.cam_tilt.angle(self.cam_tilt_cali_val)
+        except Exception as e:
+            self.log.warning(f"Servo init angles failed: {e}")
 
         # --------- motors init ---------
         self.left_rear_dir_pin = Pin(motor_pins[0])
@@ -74,23 +92,30 @@ class Picarx(object):
         self.dir_current_angle = 0
         # init pwm
         for pin in self.motor_speed_pins:
-            pin.period(self.PERIOD)
-            pin.prescaler(self.PRESCALER)
+            try:
+                pin.period(self.PERIOD)
+                pin.prescaler(self.PRESCALER)
+            except Exception as e:
+                self.log.warning(f"Motor PWM init failed: {e}")
 
         # --------- grayscale module init ---------
-        adc0, adc1, adc2 = [ADC(pin) for pin in grayscale_pins]
-        self.grayscale = Grayscale_Module(adc0, adc1, adc2, reference=None)
+        # Use safe wrappers for sensors
+        a0, a1, a2 = grayscale_pins
+        self.grayscale = SafeGrayscale(a0, a1, a2)
         # get reference
         self.line_reference = self.config_flie.get("line_reference", default_value=str(self.DEFAULT_LINE_REF))
         self.line_reference = [float(i) for i in self.line_reference.strip().strip('[]').split(',')]
         self.cliff_reference = self.config_flie.get("cliff_reference", default_value=str(self.DEFAULT_CLIFF_REF))
         self.cliff_reference = [float(i) for i in self.cliff_reference.strip().strip('[]').split(',')]
         # transfer reference
-        self.grayscale.reference(self.line_reference)
+        try:
+            self.grayscale.reference(self.line_reference)
+        except Exception as e:
+            self.log.warning(f"Set grayscale reference failed: {e}")
 
         # --------- ultrasonic init ---------
-        trig, echo= ultrasonic_pins
-        self.ultrasonic = Ultrasonic(Pin(trig), Pin(echo, mode=Pin.IN, pull=Pin.PULL_DOWN))
+        trig, echo = ultrasonic_pins
+        self.ultrasonic = SafeUltrasonic(trig, echo)
         
     def set_motor_speed(self, motor, speed):
         ''' set motor speed
@@ -111,12 +136,15 @@ class Picarx(object):
         if speed != 0:
             speed = int(speed /2 ) + 50
         speed = speed - self.cali_speed_value[motor]
-        if direction < 0:
-            self.motor_direction_pins[motor].high()
-            self.motor_speed_pins[motor].pulse_width_percent(speed)
-        else:
-            self.motor_direction_pins[motor].low()
-            self.motor_speed_pins[motor].pulse_width_percent(speed)
+        try:
+            if direction < 0:
+                self.motor_direction_pins[motor].high()
+                self.motor_speed_pins[motor].pulse_width_percent(speed)
+            else:
+                self.motor_direction_pins[motor].low()
+                self.motor_speed_pins[motor].pulse_width_percent(speed)
+        except Exception as e:
+            self.log.error(f"set_motor_speed failed (motor={motor+1}, speed={speed}): {e}")
 
     def motor_speed_calibration(self, value):
         self.cali_speed_value = value
@@ -213,12 +241,19 @@ class Picarx(object):
         Execute twice to make sure it stops
         '''
         for _ in range(2):
-            self.motor_speed_pins[0].pulse_width_percent(0)
-            self.motor_speed_pins[1].pulse_width_percent(0)
+            try:
+                self.motor_speed_pins[0].pulse_width_percent(0)
+                self.motor_speed_pins[1].pulse_width_percent(0)
+            except Exception as e:
+                self.log.warning(f"stop failed to set PWM to 0: {e}")
             time.sleep(0.002)
 
     def get_distance(self):
-        return self.ultrasonic.read()
+        try:
+            return self.ultrasonic.read()
+        except Exception as e:
+            self.log.warning(f"get_distance error: {e}")
+            return None
 
     def set_grayscale_reference(self, value):
         if isinstance(value, list) and len(value) == 3:
@@ -229,7 +264,8 @@ class Picarx(object):
             raise ValueError("grayscale reference must be a 1*3 list")
 
     def get_grayscale_data(self):
-        return list.copy(self.grayscale.read())
+        values = self.grayscale.read()
+        return list.copy(values) if values is not None else [0.0, 0.0, 0.0]
 
     def get_line_status(self,gm_val_list):
         return self.grayscale.read_status(gm_val_list)
@@ -251,10 +287,15 @@ class Picarx(object):
             raise ValueError("grayscale reference must be a 1*3 list")
 
     def reset(self):
-        self.stop()
-        self.set_dir_servo_angle(0)
-        self.set_cam_tilt_angle(0)
-        self.set_cam_pan_angle(0)
+        try:
+            self.stop()
+        finally:
+            try:
+                self.set_dir_servo_angle(0)
+                self.set_cam_tilt_angle(0)
+                self.set_cam_pan_angle(0)
+            except Exception as e:
+                self.log.warning(f"reset servo angles failed: {e}")
 
 if __name__ == "__main__":
     px = Picarx()
