@@ -50,6 +50,10 @@ class PowerManager:
     def speed_scale(self) -> float:
         return float(self._scale)
 
+    def get_battery_voltage(self) -> float:
+        """Get current battery voltage reading"""
+        return self._status.voltage_v
+
     def _read_voltage(self) -> float:
         try:
             if get_battery_voltage:
