@@ -4,6 +4,7 @@ import time
 import os
 from .logging_setup import init_logger
 from .sensors import SafeUltrasonic, SafeGrayscale
+from .poller import SensorPoller
 
 
 def constrain(x, min_val, max_val):
@@ -116,6 +117,17 @@ class Picarx(object):
         # --------- ultrasonic init ---------
         trig, echo = ultrasonic_pins
         self.ultrasonic = SafeUltrasonic(trig, echo)
+
+        # --------- background sensor poller ---------
+        try:
+            self._poller = SensorPoller(
+                ultrasonic_read=self.ultrasonic.read,
+                grayscale_read=self.grayscale.read,
+            )
+            self._poller.start()
+        except Exception as e:
+            self._poller = None
+            self.log.warning(f"SensorPoller init failed: {e}")
         
     def set_motor_speed(self, motor, speed):
         ''' set motor speed
@@ -249,6 +261,12 @@ class Picarx(object):
             time.sleep(0.002)
 
     def get_distance(self):
+        # Prefer fast, cached reading
+        if getattr(self, "_poller", None):
+            v = self._poller.get_distance()
+            if v is not None:
+                return v
+        # Fallback to direct read
         try:
             return self.ultrasonic.read()
         except Exception as e:
@@ -264,7 +282,13 @@ class Picarx(object):
             raise ValueError("grayscale reference must be a 1*3 list")
 
     def get_grayscale_data(self):
-        values = self.grayscale.read()
+        # Prefer fast, cached reading
+        if getattr(self, "_poller", None):
+            values = self._poller.get_grayscale()
+            if values is None:
+                values = self.grayscale.read()
+        else:
+            values = self.grayscale.read()
         return list.copy(values) if values is not None else [0.0, 0.0, 0.0]
 
     def get_line_status(self,gm_val_list):
@@ -296,6 +320,12 @@ class Picarx(object):
                 self.set_cam_pan_angle(0)
             except Exception as e:
                 self.log.warning(f"reset servo angles failed: {e}")
+            # stop poller last
+            try:
+                if getattr(self, "_poller", None):
+                    self._poller.stop()
+            except Exception:
+                pass
 
 if __name__ == "__main__":
     px = Picarx()
