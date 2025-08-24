@@ -6,6 +6,7 @@ from typing import Optional
 from .logging_setup import init_logger
 from .behavior_tree import Selector, Sequence, Condition, Action, Status
 from .fusion import SensorFusion
+from .speed import SpeedPlanner
 
 
 class AutonomousController:
@@ -21,6 +22,8 @@ class AutonomousController:
         self.px = px
         self.log = init_logger("picarx.autonomy")
         self.fusion = fusion or SensorFusion(px)
+        self._planner = SpeedPlanner()
+        self._last_tick = time.time()
         self._build_tree()
 
     # predicates
@@ -44,11 +47,13 @@ class AutonomousController:
 
     # actions
     def _act_stop(self) -> Status:
+        self._planner.reset(0)
         self.px.stop()
         return Status.SUCCESS
 
     def _act_avoid(self) -> Status:
         # simple avoidance: stop, steer away, reverse a bit, then straighten
+        self._planner.reset(0)
         self.px.stop()
         time.sleep(0.05)
         self.px.set_dir_servo_angle(-25)
@@ -59,7 +64,16 @@ class AutonomousController:
         return Status.SUCCESS
 
     def _act_slow(self) -> Status:
-        self.px.set_power(30)
+        st = self.fusion.update()
+        # base slower speed near obstacle; planner will further limit by distance
+        base = 35
+        target = self._planner.limit_by_distance(st.distance_cm, base_speed=base)
+        now = time.time()
+        dt = max(0.005, now - self._last_tick)
+        emergency = (st.distance_cm or 999.0) <= (self.fusion.obstacle_stop_cm + 4.0)
+        cmd = self._planner.step(target, dt, emergency=emergency)
+        self._last_tick = now
+        self.px.forward(cmd)
         return Status.SUCCESS
 
     def _act_line_follow(self) -> Status:
@@ -70,15 +84,29 @@ class AutonomousController:
         k = 40.0
         steer = int(max(-30, min(30, k * st.line_error)))
         self.px.set_dir_servo_angle(steer)
-        # dynamic speed: reduce speed when steering hard
-        base = 55
-        speed = max(30, int(base - abs(steer) * 0.6))
-        self.px.forward(speed)
+        # dynamic base speed by steering, then distance-limit and rate-limit
+        base = max(30, int(60 - abs(steer) * 0.7))
+        base = min(base, 70)
+        target = self._planner.limit_by_distance(st.distance_cm, base_speed=base)
+        now = time.time()
+        dt = max(0.005, now - self._last_tick)
+        emergency = (st.distance_cm or 999.0) <= (self.fusion.obstacle_stop_cm + 4.0)
+        cmd = self._planner.step(target, dt, emergency=emergency)
+        self._last_tick = now
+        self.px.forward(cmd)
         return Status.SUCCESS
 
     def _act_cruise(self) -> Status:
         self.px.set_dir_servo_angle(0)
-        self.px.forward(50)
+        # open area cruising base
+        st = self.fusion.update()
+        base = 55
+        target = self._planner.limit_by_distance(st.distance_cm, base_speed=base)
+        now = time.time()
+        dt = max(0.005, now - self._last_tick)
+        cmd = self._planner.step(target, dt)
+        self._last_tick = now
+        self.px.forward(cmd)
         return Status.SUCCESS
 
     def _build_tree(self):
