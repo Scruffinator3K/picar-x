@@ -5,6 +5,7 @@ from typing import List, Optional
 import time
 
 from .logging_setup import init_logger
+from .vision import Vision
 
 
 @dataclass
@@ -19,12 +20,13 @@ class FusionState:
 class SensorFusion:
     """Combines sensor readings into a compact state for control logic."""
 
-    def __init__(self, px, obstacle_stop_cm: float = 18.0, obstacle_slow_cm: float = 28.0):
+    def __init__(self, px, obstacle_stop_cm: float = 18.0, obstacle_slow_cm: float = 28.0, vision: Optional[Vision] = None):
         self.px = px
         self.log = init_logger("picarx.fusion")
         self.obstacle_stop_cm = obstacle_stop_cm
         self.obstacle_slow_cm = obstacle_slow_cm
         self._last: Optional[FusionState] = None
+        self.vision = vision or Vision(use_capture=False)
 
     def _compute_line_error(self, gs: List[float]) -> Optional[float]:
         if not gs or len(gs) != 3:
@@ -45,6 +47,12 @@ class SensorFusion:
         except Exception:
             cliff = False
         line_err = self._compute_line_error(gs) if gs else None
+        # If no grayscale line error (no painted lines), try vision-based road edge error
+        if line_err is None and self.vision and self.vision.last():
+            v = self.vision.last() or {}
+            ve = v.get("line_error")
+            if isinstance(ve, (float, int)):
+                line_err = float(ve)
         self._last = FusionState(ts=time.time(), distance_cm=dist, grayscale=gs, line_error=line_err, cliff=cliff)
         return self._last
 
