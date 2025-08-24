@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from typing import Literal, Optional
 
 
-Mode = Literal["auto", "manual"]
+Mode = Literal["auto", "manual", "idle"]
 
 
 @dataclass
@@ -25,8 +25,8 @@ class ModeManager:
             return self._mode
 
     def set_mode(self, mode: Mode) -> None:
-        if mode not in ("auto", "manual"):
-            raise ValueError("mode must be 'auto' or 'manual'")
+        if mode not in ("auto", "manual", "idle"):
+            raise ValueError("mode must be 'auto', 'manual', or 'idle'")
         with self._lock:
             self._mode = mode
 

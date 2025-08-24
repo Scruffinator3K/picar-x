@@ -8,14 +8,28 @@ from picarx.configuration import load_config
 from picarx.telemetry import TelemetryServer
 from picarx.watchdog import SafetyWatchdog
 from picarx.mode import ModeManager
-from picarx.vision import Vision
+from picarx.perception import Perception
+from picarx.slam import OccupancyGridSLAM
+from picarx.adaptive import AdaptiveController
+from picarx.learning import EpsilonGreedyBandit, BanditConfig
+from picarx.power import PowerManager
 
 
 def main():
     cfg = load_config()
     px = Picarx()
-    ctrl = AutonomousController(px)
-    vision = Vision(use_capture=True)
+    # Start edge perception (object detection, gestures, tracking)
+    perception = Perception(cfg, use_capture=True)
+    # Phase 3 modules
+    slam = OccupancyGridSLAM()
+    adaptive = AdaptiveController()
+    bandit = EpsilonGreedyBandit(BanditConfig())
+    current_arm = 1.0
+    # Power/battery manager
+    power = PowerManager(cfg)
+    power.start()
+    # Autonomy with speed scaling hook
+    ctrl = AutonomousController(px, perception=perception, speed_scale_cb=lambda: current_arm)
     modes = ModeManager(initial="auto")
 
     # Watchdog and telemetry
@@ -34,14 +48,37 @@ def main():
             "distance_cm": px.get_distance(),
             "grayscale": px.get_grayscale_data(),
             "mode": modes.get_mode(),
+            "battery": {
+                "voltage_v": round(power.status().voltage_v, 2),
+                "low": power.status().low,
+                "critical": power.status().critical,
+                "speed_scale": round(power.speed_scale(), 2),
+            },
+            # Perception summary for dashboard
+            **({
+                "perception": {
+                    "gesture": (perception.last().gesture if perception.last() else None),
+                    "inference_ms": (perception.last().inference_ms if perception.last() else 0.0),
+                    "fps": (perception.last().fps if perception.last() else 0.0),
+                    # limit telemetry object list to avoid large payloads
+                    "objects": [
+                        {
+                            "label": o.label,
+                            "score": round(o.score, 3),
+                            "bbox": list(map(float, o.bbox_xywh)),
+                            "track_id": o.track_id,
+                            "depth_cm": o.depth_cm,
+                        }
+                        for o in ((perception.last().objects if perception.last() else [])[:8])
+                    ],
+                }
+            })
         },
         on_heartbeat=wd.heartbeat,
         on_set_mode=modes.set_mode,
         on_manual=lambda sp, st: modes.set_manual_command(speed=sp, steer=st),
-        get_snapshot=(
-            (lambda: (vision.last() and None))  # placeholder if no camera API
-            if vision is None else None
-        ),
+        get_snapshot=perception.get_jpeg,
+        get_map=lambda: slam.get_map_jpeg(scale=2),
     )
     tel.start()
     try:
@@ -54,7 +91,15 @@ def main():
                 else:
                     px.backward(-cmd.speed)
             else:
-                ctrl.tick()
+                # scale selection via bandit
+                current_arm = bandit.select() * power.speed_scale()
+                status = ctrl.tick()
+                # reward: higher for speed, penalize near obstacle
+                dist = px.get_distance()
+                spd = ctrl.last_speed_cmd()
+                reward = (spd / 100.0) - (0.5 if (dist and dist < 25) else 0.0)
+                # SLAM update with current cmd and sensor distance
+                slam.update(speed_cmd=spd, steer_angle_deg=ctrl.last_steer_cmd(), distance_cm=dist)
             wd.heartbeat()
             time.sleep(0.02)  # 50 Hz control loop
     except KeyboardInterrupt:
@@ -70,6 +115,14 @@ def main():
             pass
         try:
             tel.stop()
+        except Exception:
+            pass
+        try:
+            power.stop()
+        except Exception:
+            pass
+        try:
+            perception.stop()
         except Exception:
             pass
 

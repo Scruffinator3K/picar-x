@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import time
-from typing import Optional
+from typing import Optional, Callable
 
 from .logging_setup import init_logger
 from .behavior_tree import Selector, Sequence, Condition, Action, Status
 from .fusion import SensorFusion
+from .perception import Perception
 from .speed import SpeedPlanner
 
 
@@ -18,12 +19,17 @@ class AutonomousController:
     - Otherwise line-follow, else roam forward
     """
 
-    def __init__(self, px, fusion: Optional[SensorFusion] = None):
+    def __init__(self, px, fusion: Optional[SensorFusion] = None, perception: Optional[Perception] = None,
+                 speed_scale_cb: Optional[Callable[[], float]] = None):
         self.px = px
         self.log = init_logger("picarx.autonomy")
         self.fusion = fusion or SensorFusion(px)
+        self.perception = perception
         self._planner = SpeedPlanner()
         self._last_tick = time.time()
+        self._last_speed_cmd: int = 0
+        self._last_steer_cmd: int = 0
+        self.get_speed_scale: Callable[[], float] = speed_scale_cb or (lambda: 1.0)
         self._build_tree()
 
     # predicates
@@ -41,6 +47,15 @@ class AutonomousController:
         d = state.distance_cm or 999.0
         return d <= self.fusion.obstacle_slow_cm
 
+    def _gesture_stop(self) -> bool:
+        try:
+            if self.perception is None:
+                return False
+            st = self.perception.last()
+            return bool(st and st.gesture == "stop")
+        except Exception:
+            return False
+
     def _has_line(self) -> bool:
         state = self.fusion.update()
         return state.line_error is not None
@@ -49,6 +64,7 @@ class AutonomousController:
     def _act_stop(self) -> Status:
         self._planner.reset(0)
         self.px.stop()
+        self._last_speed_cmd = 0
         return Status.SUCCESS
 
     def _act_avoid(self) -> Status:
@@ -57,10 +73,14 @@ class AutonomousController:
         self.px.stop()
         time.sleep(0.05)
         self.px.set_dir_servo_angle(-25)
+        self._last_steer_cmd = -25
         self.px.backward(50)
+        self._last_speed_cmd = -50
         time.sleep(0.3)
         self.px.stop()
+        self._last_speed_cmd = 0
         self.px.set_dir_servo_angle(0)
+        self._last_steer_cmd = 0
         return Status.SUCCESS
 
     def _act_slow(self) -> Status:
@@ -68,12 +88,14 @@ class AutonomousController:
         # base slower speed near obstacle; planner will further limit by distance
         base = 35
         target = self._planner.limit_by_distance(st.distance_cm, base_speed=base)
+        target = int(max(0, min(100, target * self.get_speed_scale())))
         now = time.time()
         dt = max(0.005, now - self._last_tick)
         emergency = (st.distance_cm or 999.0) <= (self.fusion.obstacle_stop_cm + 4.0)
         cmd = self._planner.step(target, dt, emergency=emergency)
         self._last_tick = now
         self.px.forward(cmd)
+        self._last_speed_cmd = cmd
         return Status.SUCCESS
 
     def _act_line_follow(self) -> Status:
@@ -84,33 +106,41 @@ class AutonomousController:
         k = 40.0
         steer = int(max(-30, min(30, k * st.line_error)))
         self.px.set_dir_servo_angle(steer)
+        self._last_steer_cmd = steer
         # dynamic base speed by steering, then distance-limit and rate-limit
         base = max(30, int(60 - abs(steer) * 0.7))
         base = min(base, 70)
         target = self._planner.limit_by_distance(st.distance_cm, base_speed=base)
+        target = int(max(0, min(100, target * self.get_speed_scale())))
         now = time.time()
         dt = max(0.005, now - self._last_tick)
         emergency = (st.distance_cm or 999.0) <= (self.fusion.obstacle_stop_cm + 4.0)
         cmd = self._planner.step(target, dt, emergency=emergency)
         self._last_tick = now
         self.px.forward(cmd)
+        self._last_speed_cmd = cmd
         return Status.SUCCESS
 
     def _act_cruise(self) -> Status:
         self.px.set_dir_servo_angle(0)
+        self._last_steer_cmd = 0
         # open area cruising base
         st = self.fusion.update()
         base = 55
         target = self._planner.limit_by_distance(st.distance_cm, base_speed=base)
+        target = int(max(0, min(100, target * self.get_speed_scale())))
         now = time.time()
         dt = max(0.005, now - self._last_tick)
         cmd = self._planner.step(target, dt)
         self._last_tick = now
         self.px.forward(cmd)
+        self._last_speed_cmd = cmd
         return Status.SUCCESS
 
     def _build_tree(self):
         self.tree = Selector([
+            # 0) User gesture stop overrides everything
+            Sequence([Condition(self._gesture_stop), Action(self._act_stop)]),
             # 1) Emergency stop
             Sequence([Condition(self._is_cliff), Action(self._act_stop)]),
             # 2) Obstacle avoidance
@@ -128,3 +158,10 @@ class AutonomousController:
             self.log.error(f"autonomy tick error: {e}")
             self.px.stop()
             return Status.FAILURE
+
+    # Phase 3 helpers
+    def last_speed_cmd(self) -> int:
+        return int(self._last_speed_cmd)
+
+    def last_steer_cmd(self) -> int:
+        return int(self._last_steer_cmd)
