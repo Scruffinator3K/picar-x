@@ -19,7 +19,7 @@ class SafetyWatchdog:
         stop_fn: Callable[[], None],
         get_distance_fn: Callable[[], Optional[float]],
         heartbeat_timeout_s: float = 0.5,
-        hard_stop_distance_cm: float = 10.0,
+    hard_stop_distance_cm: float = 8.0,
         logger_name: str = "picarx.watchdog",
     ) -> None:
         self.log = init_logger(logger_name)
@@ -58,14 +58,25 @@ class SafetyWatchdog:
             if d is not None and d <= self._hard_stop_cm:
                 self.log.warning(f"Hard-stop distance reached ({d:.1f} cm). Stopping.")
                 try:
-                    self._stop_fn()
+                    # Use slow_stop if the stop function belongs to a Picarx instance
+                    owner = getattr(self._stop_fn, "__self__", None)
+                    slow = getattr(owner, "slow_stop", None)
+                    if callable(slow):
+                        slow(duration_s=0.4, steps=10)
+                    else:
+                        self._stop_fn()
                 except Exception:
                     pass
             # Heartbeat timeout
             if now - self._last_beat > self._timeout:
                 self.log.warning("Heartbeat timeout. Stopping motors.")
                 try:
-                    self._stop_fn()
+                    owner = getattr(self._stop_fn, "__self__", None)
+                    slow = getattr(owner, "slow_stop", None)
+                    if callable(slow):
+                        slow(duration_s=0.5, steps=12)
+                    else:
+                        self._stop_fn()
                 except Exception:
                     pass
                 self._last_beat = now  # avoid spamming

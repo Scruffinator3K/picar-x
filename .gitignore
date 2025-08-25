@@ -1,4 +1,15 @@
-# IDE
+dist/
+build/
+*.egg-info/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.venv/
+venv/
+env/
+*.log# IDE
 .vscode/*
 .idea/
 *.swp

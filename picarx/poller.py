@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import threading
 import time
-from typing import Callable, List, Optional, Tuple
+from typing import List, Optional, Callable
+from collections import deque
 
 from .logging_setup import init_logger
 
@@ -38,6 +39,8 @@ class SensorPoller:
 
         self._ultra_last: Optional[float] = None
         self._ultra_last_ts: float = 0.0
+        # Add moving average filter for ultrasonic sensor to reduce noise
+        self._ultra_buffer: deque = deque(maxlen=5)  # Keep last 5 readings for averaging
 
         self._gray_last: Optional[List[float]] = None
         self._gray_last_ts: float = 0.0
@@ -68,8 +71,30 @@ class SensorPoller:
                 try:
                     v = self.ultrasonic_read() if self.ultrasonic_read else None
                     if v is not None:
+                        raw_distance = float(v)
                         with self._ultra_lock:
-                            self._ultra_last = float(v)
+                            # Add to moving average buffer
+                            self._ultra_buffer.append(raw_distance)
+                            
+                            # Apply filtering: remove outliers and average
+                            if len(self._ultra_buffer) >= 3:
+                                readings = list(self._ultra_buffer)
+                                # Remove extreme outliers (readings that differ by >50% from median)
+                                readings.sort()
+                                median = readings[len(readings) // 2]
+                                filtered = [r for r in readings if abs(r - median) / max(median, 1.0) < 0.5]
+                                if filtered:
+                                    filtered_distance = sum(filtered) / len(filtered)
+                                else:
+                                    filtered_distance = median
+                                
+                                # Log significant changes for debugging
+                                if abs(raw_distance - filtered_distance) > 3.0:
+                                    self.log.debug(f"Ultrasonic filter: raw={raw_distance:.1f}cm -> filtered={filtered_distance:.1f}cm")
+                                
+                                self._ultra_last = filtered_distance
+                            else:
+                                self._ultra_last = raw_distance
                             self._ultra_last_ts = now
                 except Exception as e:
                     # errors already handled by SafeUltrasonic; keep loop alive

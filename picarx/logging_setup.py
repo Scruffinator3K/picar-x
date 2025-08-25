@@ -19,6 +19,9 @@ def init_logger(name: str = "picarx", level: Optional[int] = None, log_dir: Opti
     - Respects PICARX_LOG_LEVEL and PICARX_LOG_DIR env vars
     """
     logger = logging.getLogger(name)
+    # Avoid messages bubbling up to parent loggers (which would duplicate output
+    # when both parent and child have handlers).
+    logger.propagate = False
     if logger.handlers:
         # already configured
         return logger
@@ -45,6 +48,9 @@ def init_logger(name: str = "picarx", level: Optional[int] = None, log_dir: Opti
     except Exception:
         # If file handler fails (e.g., permissions), still keep console logging
         pass
+
+    # Final safeguard against duplicate propagation
+    logger.propagate = False
 
     logger.debug("Logger initialized")
     return logger

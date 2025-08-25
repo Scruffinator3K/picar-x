@@ -67,23 +67,23 @@ class PerformanceConfig:
 
 @dataclass
 class FusionConfig:
-    obstacle_stop_cm: float = 18.0
-    obstacle_slow_cm: float = 28.0
+    obstacle_stop_cm: float = 12.0  # Reduced from 18.0 - stop closer to obstacles
+    obstacle_slow_cm: float = 22.0  # Reduced from 28.0 - start slowing at reasonable distance
 
 
 @dataclass
 class SpeedConfig:
     max_speed: int = 100
-    min_speed: int = 0
+    min_speed: int = 20  # Increased from 0 - maintain minimum momentum
     max_accel_per_s: float = 80.0
-    max_decel_per_s: float = 120.0
-    emergency_decel_per_s: float = 300.0
+    max_decel_per_s: float = 80.0  # Reduced from 120.0 - gentler deceleration
+    emergency_decel_per_s: float = 200.0  # Reduced from 300.0 - less harsh emergency stops
 
 
 @dataclass
 class WatchdogConfig:
     heartbeat_timeout_s: float = 0.5
-    hard_stop_distance_cm: float = 10.0
+    hard_stop_distance_cm: float = 30.0  # Increased from 15.0 - much more conservative for stability
 
 
 @dataclass

@@ -40,15 +40,27 @@ class DetectedObject:
     bbox_xywh: Tuple[float, float, float, float]  # x, y, w, h in pixels
     track_id: Optional[int] = None
     depth_cm: Optional[float] = None
+    # Enhanced attributes
+    classification: Optional[str] = None  # Fine-grained classification
+    confidence_level: str = "medium"  # "high", "medium", "low"
+    relative_size: str = "medium"  # "large", "medium", "small"
+    position: str = "center"  # "left", "center", "right", "top", "bottom"
+    motion: Optional[str] = None  # "moving", "stationary", "approaching"
+    threat_level: str = "safe"  # "safe", "caution", "danger"
 
 
 @dataclass
 class PerceptionState:
     ts: float
     objects: List[DetectedObject] = field(default_factory=list)
-    gesture: Optional[str] = None  # 'stop'|'go'|'left'|'right'|None
+    gesture: Optional[str] = None  # Enhanced gestures: 'stop'|'go'|'left'|'right'|'wave'|'point'|'peace'|None
     fps: float = 0.0
     inference_ms: float = 0.0
+    # Enhanced scene understanding
+    scene_description: str = "clear"  # "clear", "crowded", "obstacle_ahead", "person_nearby"
+    dominant_objects: List[str] = field(default_factory=list)  # Most prominent object types
+    safety_assessment: str = "safe"  # "safe", "caution", "danger"
+    recommended_action: Optional[str] = None  # "slow", "stop", "avoid_left", "avoid_right"
 
 
 class _SimpleTracker:
@@ -65,8 +77,10 @@ class _SimpleTracker:
         return x + w / 2.0, y + h / 2.0
 
     def update(self, detections: List[DetectedObject]) -> List[DetectedObject]:
-        # Age tracks
+        # Age tracks and store previous positions
         for t in self._tracks.values():
+            t["prev_cx"] = t.get("cx", 0)
+            t["prev_cy"] = t.get("cy", 0)
             t["age"] += 1
 
         # Assign by nearest neighbor on centroids
@@ -87,10 +101,34 @@ class _SimpleTracker:
             if best_i is not None and best_d < (t.get("gate", 80.0) ** 2):
                 # associate
                 cx, cy = self._centroid(detections[best_i].bbox_xywh)
+                
+                # Calculate motion before smoothing
+                dx = cx - t.get("prev_cx", cx)
+                dy = cy - t.get("prev_cy", cy)
+                motion_speed = (dx**2 + dy**2)**0.5
+                
+                # Determine motion direction
+                if motion_speed < 3:
+                    motion = "stationary"
+                elif abs(dx) > abs(dy):
+                    motion = "moving_right" if dx > 0 else "moving_left"
+                else:
+                    motion = "moving_down" if dy > 0 else "moving_up"
+                
+                # Update detection with motion info
+                detections[best_i].motion = motion
+                
                 # EMA smoothing
                 t["cx"] = 0.6 * t["cx"] + 0.4 * cx
                 t["cy"] = 0.6 * t["cy"] + 0.4 * cy
                 t["age"] = 0
+                
+                # Store motion history
+                t["motion_history"] = t.get("motion_history", [])
+                t["motion_history"].append((dx, dy))
+                if len(t["motion_history"]) > 5:
+                    t["motion_history"].pop(0)
+                
                 detections[best_i].track_id = tid
                 unmatched.remove(best_i)
 
@@ -99,12 +137,18 @@ class _SimpleTracker:
             cx, cy = self._centroid(detections[i].bbox_xywh)
             tid = self._next_id
             self._next_id += 1
-            self._tracks[tid] = {"cx": cx, "cy": cy, "age": 0, "gate": 120.0}
+            self._tracks[tid] = {
+                "cx": cx, "cy": cy, "age": 0, "gate": 120.0,
+                "prev_cx": cx, "prev_cy": cy, "motion_history": [(0, 0)]
+            }
             detections[i].track_id = tid
+            detections[i].motion = "appearing"
 
         # Drop old tracks
         for tid in [tid for tid, t in self._tracks.items() if t["age"] > self._max_age]:
             self._tracks.pop(tid, None)
+
+        return detections
 
         return detections
 
@@ -419,9 +463,174 @@ class Perception:
                         d.depth_cm = float((ref_h * f) / h)
 
         t1 = time.time()
-        state = PerceptionState(ts=t1, objects=dets, gesture=gesture, inference_ms=(t1 - t0) * 1000.0)
+        
+        # 5) Enhanced object analysis and scene understanding
+        enhanced_objects = self._enhance_object_analysis(dets, frame)
+        scene_analysis = self._analyze_scene(enhanced_objects, frame)
+        
+        state = PerceptionState(
+            ts=t1, 
+            objects=enhanced_objects, 
+            gesture=gesture, 
+            inference_ms=(t1 - t0) * 1000.0,
+            scene_description=scene_analysis["description"],
+            dominant_objects=scene_analysis["dominant_objects"],
+            safety_assessment=scene_analysis["safety"],
+            recommended_action=scene_analysis["action"]
+        )
         self._last_state = state
         return state
+
+    def _enhance_object_analysis(self, objects: List[DetectedObject], frame) -> List[DetectedObject]:
+        """Enhanced object analysis with classification, positioning, and threat assessment."""
+        if not objects:
+            return objects
+            
+        H, W = frame.shape[:2]
+        frame_area = H * W
+        
+        for obj in objects:
+            x, y, w, h = obj.bbox_xywh
+            obj_area = w * h
+            
+            # Confidence level based on score
+            if obj.score >= 0.8:
+                obj.confidence_level = "high"
+            elif obj.score >= 0.5:
+                obj.confidence_level = "medium"
+            else:
+                obj.confidence_level = "low"
+            
+            # Relative size assessment
+            size_ratio = obj_area / frame_area
+            if size_ratio > 0.3:
+                obj.relative_size = "large"
+            elif size_ratio > 0.1:
+                obj.relative_size = "medium"
+            else:
+                obj.relative_size = "small"
+            
+            # Position in frame
+            center_x = x + w/2
+            center_y = y + h/2
+            if center_x < W * 0.33:
+                h_pos = "left"
+            elif center_x > W * 0.67:
+                h_pos = "right"
+            else:
+                h_pos = "center"
+            
+            if center_y < H * 0.33:
+                v_pos = "top"
+            elif center_y > H * 0.67:
+                v_pos = "bottom"
+            else:
+                v_pos = "middle"
+                
+            obj.position = f"{v_pos}_{h_pos}" if v_pos != "middle" else h_pos
+            
+            # Enhanced classification based on label and characteristics
+            obj.classification = self._classify_object(obj.label, obj.relative_size, obj.position)
+            
+            # Threat assessment
+            obj.threat_level = self._assess_threat(obj)
+            
+        return objects
+    
+    def _classify_object(self, label: str, size: str, position: str) -> str:
+        """Enhanced object classification with context."""
+        classifications = {
+            "person": f"{size}_person_{position}",
+            "car": f"{size}_vehicle_{position}",
+            "bicycle": f"{size}_bike_{position}",
+            "dog": f"{size}_animal_{position}",
+            "cat": f"{size}_animal_{position}",
+            "chair": f"{size}_furniture_{position}",
+            "bottle": f"{size}_object_{position}",
+            "cup": f"{size}_object_{position}",
+            "book": f"{size}_object_{position}",
+        }
+        return classifications.get(label.lower(), f"{size}_{label}_{position}")
+    
+    def _assess_threat(self, obj: DetectedObject) -> str:
+        """Assess threat level based on object characteristics."""
+        # High threat: Large moving objects in center/path
+        if obj.label.lower() in ["person", "car", "bicycle", "motorcycle"] and obj.relative_size == "large":
+            if "center" in obj.position:
+                return "danger"
+            else:
+                return "caution"
+        
+        # Medium threat: Animals, unknown objects
+        if obj.label.lower() in ["dog", "cat", "animal"] and obj.relative_size in ["medium", "large"]:
+            return "caution"
+        
+        # Low threat: Small objects, furniture
+        return "safe"
+    
+    def _analyze_scene(self, objects: List[DetectedObject], frame) -> Dict[str, Any]:
+        """Comprehensive scene analysis for autonomous navigation."""
+        if not objects:
+            return {
+                "description": "clear",
+                "dominant_objects": [],
+                "safety": "safe",
+                "action": None
+            }
+        
+        # Count objects by type
+        object_counts = {}
+        for obj in objects:
+            label = obj.label.lower()
+            object_counts[label] = object_counts.get(label, 0) + 1
+        
+        # Dominant objects (most frequent)
+        dominant = sorted(object_counts.items(), key=lambda x: x[1], reverse=True)[:3]
+        dominant_objects = [item[0] for item in dominant]
+        
+        # Safety assessment
+        danger_objects = [obj for obj in objects if obj.threat_level == "danger"]
+        caution_objects = [obj for obj in objects if obj.threat_level == "caution"]
+        
+        if danger_objects:
+            safety = "danger"
+            # Find recommended avoidance action
+            center_dangers = [obj for obj in danger_objects if "center" in obj.position]
+            left_dangers = [obj for obj in danger_objects if "left" in obj.position]
+            right_dangers = [obj for obj in danger_objects if "right" in obj.position]
+            
+            if center_dangers:
+                if len(left_dangers) < len(right_dangers):
+                    action = "avoid_left"
+                elif len(right_dangers) < len(left_dangers):
+                    action = "avoid_right"
+                else:
+                    action = "stop"
+            else:
+                action = "slow"
+        elif caution_objects:
+            safety = "caution"
+            action = "slow"
+        else:
+            safety = "safe"
+            action = None
+        
+        # Scene description
+        if len(objects) > 5:
+            description = "crowded"
+        elif danger_objects:
+            description = "obstacle_ahead"
+        elif any(obj.label.lower() == "person" for obj in objects):
+            description = "person_nearby"
+        else:
+            description = "clear"
+        
+        return {
+            "description": description,
+            "dominant_objects": dominant_objects,
+            "safety": safety,
+            "action": action
+        }
 
     # helpers
     def _class_to_label(self, cid: int) -> str:

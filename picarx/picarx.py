@@ -5,6 +5,7 @@ import os
 from .logging_setup import init_logger
 from .sensors import SafeUltrasonic, SafeGrayscale
 from .poller import SensorPoller
+from .servo_control import ComprehensiveServoController
 
 
 def constrain(x, min_val, max_val):
@@ -35,16 +36,13 @@ class Picarx(object):
     # grayscale_pins: 3 adc channels
     # ultrasonic_pins: trig, echo2
     # config: path of config file
-    def __init__(self, 
-                servo_pins:list=['P0', 'P1', 'P2'], 
-                motor_pins:list=['D4', 'D5', 'P13', 'P12'],
-                grayscale_pins:list=['A0', 'A1', 'A2'],
-                ultrasonic_pins:list=['D2','D3'],
-                config:str=CONFIG,
-                ):
-
+    def __init__(self, servo_pins: list = ['P0', 'P1', 'P2'], motor_pins: list = ['D4', 'D5', 'P13', 'P12'], grayscale_pins: list = ['A0', 'A1', 'A2'], ultrasonic_pins: list = ['D2', 'D3'], config: str = CONFIG):
+        
         # logger
         self.log = init_logger("picarx")
+
+        # boot timestamp for early rate-limiting
+        self._boot_ts = time.time()
 
         # reset robot_hat with guard
         try:
@@ -67,17 +65,29 @@ class Picarx(object):
         self.cam_pan = Servo(servo_pins[0])
         self.cam_tilt = Servo(servo_pins[1])
         self.dir_servo_pin = Servo(servo_pins[2])
+        
+        # Initialize COMPREHENSIVE servo controller with advanced anti-jitter protection
+        self.servo_controller = ComprehensiveServoController(self)
+        
+        # Legacy support - track last sent angles for compatibility
+        self._last_pan_angle_sent = None
+        self._last_tilt_angle_sent = None
+        self._last_dir_angle_sent = None
+        
         # get calibration values
         self.dir_cali_val = float(self.config_flie.get("picarx_dir_servo", default_value=0))
         self.cam_pan_cali_val = float(self.config_flie.get("picarx_cam_pan_servo", default_value=0))
         self.cam_tilt_cali_val = float(self.config_flie.get("picarx_cam_tilt_servo", default_value=0))
-        # set servos to init angle
-        try:
-            self.dir_servo_pin.angle(self.dir_cali_val)
-            self.cam_pan.angle(self.cam_pan_cali_val)
-            self.cam_tilt.angle(self.cam_tilt_cali_val)
-        except Exception as e:
-            self.log.warning(f"Servo init angles failed: {e}")
+        
+        # set servos to init angle using the comprehensive controller
+        self.servo_controller.force_servo_position("cam_pan", self.cam_pan_cali_val)
+        self.servo_controller.force_servo_position("cam_tilt", self.cam_tilt_cali_val) 
+        self.servo_controller.force_servo_position("dir_servo", self.dir_cali_val)
+        
+        # Update legacy trackers
+        self._last_pan_angle_sent = float(self.cam_pan_cali_val)
+        self._last_tilt_angle_sent = float(self.cam_tilt_cali_val)
+        self._last_dir_angle_sent = float(self.dir_cali_val)
 
         # --------- motors init ---------
         self.left_rear_dir_pin = Pin(motor_pins[0])
@@ -86,6 +96,10 @@ class Picarx(object):
         self.right_rear_pwm_pin = PWM(motor_pins[3])
         self.motor_direction_pins = [self.left_rear_dir_pin, self.right_rear_dir_pin]
         self.motor_speed_pins = [self.left_rear_pwm_pin, self.right_rear_pwm_pin]
+        # Track last applied PWM duty (%) for gentle braking
+        self._last_pwm_duty = [0, 0]
+        # Track last commanded direction (-1, 1)
+        self._last_dir = [1, -1]
         # get calibration values
         self.cali_dir_value = self.config_flie.get("picarx_dir_motor", default_value="[1, 1]")
         self.cali_dir_value = [int(i.strip()) for i in self.cali_dir_value.strip().strip("[]").split(",")]
@@ -139,22 +153,31 @@ class Picarx(object):
         '''
         speed = constrain(speed, -100, 100)
         motor -= 1
+        # Determine desired direction based on sign before abs
         if speed >= 0:
             direction = 1 * self.cali_dir_value[motor]
-        elif speed < 0:
+        else:
             direction = -1 * self.cali_dir_value[motor]
-        speed = abs(speed)
-        # print(f"direction: {direction}, speed: {speed}")
-        if speed != 0:
-            speed = int(speed /2 ) + 50
-        speed = speed - self.cali_speed_value[motor]
+        # Map to PWM duty and apply calibration
+        mag = abs(speed)
+        pwm = 0 if mag == 0 else (int(mag / 2) + 50)
+        pwm = max(0, pwm - self.cali_speed_value[motor])
         try:
-            if direction < 0:
-                self.motor_direction_pins[motor].high()
-                self.motor_speed_pins[motor].pulse_width_percent(speed)
+            if pwm == 0:
+                # Avoid toggling direction lines when stopping to prevent jerk
+                self.motor_speed_pins[motor].pulse_width_percent(0)
+                self._last_pwm_duty[motor] = 0
+                # keep last direction unchanged
             else:
-                self.motor_direction_pins[motor].low()
-                self.motor_speed_pins[motor].pulse_width_percent(speed)
+                if direction < 0:
+                    self.motor_direction_pins[motor].high()
+                else:
+                    self.motor_direction_pins[motor].low()
+                self.motor_speed_pins[motor].pulse_width_percent(pwm)
+                # Record last applied state for gentle braking
+                self._last_pwm_duty[motor] = int(pwm)
+                self._last_dir[motor] = -1 if direction < 0 else 1
+
         except Exception as e:
             self.log.error(f"set_motor_speed failed (motor={motor+1}, speed={speed}): {e}")
 
@@ -166,7 +189,6 @@ class Picarx(object):
         else:
             self.cali_speed_value[0] = abs(self.cali_speed_value)
             self.cali_speed_value[1] = 0
-
     def motor_direction_calibrate(self, motor, value):
         ''' set motor direction calibration value
         
@@ -188,27 +210,92 @@ class Picarx(object):
         self.dir_servo_pin.angle(value)
 
     def set_dir_servo_angle(self, value):
-        self.dir_current_angle = constrain(value, self.DIR_MIN, self.DIR_MAX)
-        angle_value  = self.dir_current_angle + self.dir_cali_val
-        self.dir_servo_pin.angle(angle_value)
+        """Set steering servo with comprehensive anti-jitter protection."""
+        try:
+            self.dir_current_angle = constrain(value, self.DIR_MIN, self.DIR_MAX)
+            target = self.dir_current_angle + self.dir_cali_val
+            
+            # Use lower priority for steering since it needs to be more responsive
+            success = self.servo_controller.set_servo_angle("dir_servo", target, priority=-1, source="set_dir_servo_angle")
+            
+            if success:
+                self._last_dir_angle_sent = float(target)
+                self.log.debug(f"Steering command accepted: {value:.1f}° -> {target:.1f}°")
+            else:
+                self.log.debug(f"Steering command rejected by anti-jitter system")
+                
+        except Exception as e:
+            self.log.warning(f"set_dir_servo_angle failed: {e}")
 
     def cam_pan_servo_calibrate(self, value):
         self.cam_pan_cali_val = value
         self.config_flie.set("picarx_cam_pan_servo", "%s"%value)
-        self.cam_pan.angle(value)
+        # Use force command for calibration
+        self.servo_controller.force_servo_position("cam_pan", value)
+        self._last_pan_angle_sent = float(value)
 
     def cam_tilt_servo_calibrate(self, value):
         self.cam_tilt_cali_val = value
         self.config_flie.set("picarx_cam_tilt_servo", "%s"%value)
-        self.cam_tilt.angle(value)
+        # Use force command for calibration
+        self.servo_controller.force_servo_position("cam_tilt", value)
+        self._last_tilt_angle_sent = float(value)
 
     def set_cam_pan_angle(self, value):
-        value = constrain(value, self.CAM_PAN_MIN, self.CAM_PAN_MAX)
-        self.cam_pan.angle(-1*(value + -1*self.cam_pan_cali_val))
+        """Set camera pan angle with COMPREHENSIVE anti-jitter protection."""
+        try:
+            target = constrain(value, self.CAM_PAN_MIN, self.CAM_PAN_MAX)
+            success = self.servo_controller.set_servo_angle("cam_pan", target, source="set_cam_pan_angle")
+            
+            if success:
+                # Update calibrated output for legacy compatibility
+                out = -1 * (target + -1 * self.cam_pan_cali_val)
+                self._last_pan_angle_sent = float(out)
+                self.log.debug(f"Pan command accepted: {target:.1f}° -> {out:.1f}°")
+            else:
+                self.log.debug(f"Pan command rejected by anti-jitter system")
+                
+        except Exception as e:
+            self.log.warning(f"set_cam_pan_angle failed: {e}")
 
     def set_cam_tilt_angle(self,value):
-        value = constrain(value, self.CAM_TILT_MIN, self.CAM_TILT_MAX)
-        self.cam_tilt.angle(-1*(value + -1*self.cam_tilt_cali_val))
+        """Set camera tilt angle with COMPREHENSIVE anti-jitter protection."""
+        try:
+            target = constrain(value, self.CAM_TILT_MIN, self.CAM_TILT_MAX)
+            success = self.servo_controller.set_servo_angle("cam_tilt", target, source="set_cam_tilt_angle")
+            
+            if success:
+                # Update calibrated output for legacy compatibility
+                out = -1 * (target + -1 * self.cam_tilt_cali_val)
+                self._last_tilt_angle_sent = float(out)
+                self.log.debug(f"Tilt command accepted: {target:.1f}° -> {out:.1f}°")
+            else:
+                self.log.debug(f"Tilt command rejected by anti-jitter system")
+            
+        except Exception as e:
+            self.log.warning(f"set_cam_tilt_angle failed: {e}")
+
+    def get_servo_status(self):
+        """Get comprehensive servo status from the servo controller"""
+        return self.servo_controller.get_servo_status()
+    
+    def emergency_stop_servos(self):
+        """Emergency stop all servo operations"""
+        self.servo_controller.emergency_stop_all_servos()
+    
+    def resume_servos(self):
+        """Resume servo operations after emergency stop"""
+        self.servo_controller.resume_servo_operations()
+    
+    @property
+    def cam_pan_angle(self):
+        """Get current camera pan angle"""
+        return self.servo_controller.servo_states.get("cam_pan", {}).get("current_angle", 0.0)
+    
+    @property  
+    def cam_tilt_angle(self):
+        """Get current camera tilt angle"""
+        return self.servo_controller.servo_states.get("cam_tilt", {}).get("current_angle", 0.0)
 
     def set_power(self, speed):
         self.set_motor_speed(1, speed)
@@ -259,6 +346,41 @@ class Picarx(object):
             except Exception as e:
                 self.log.warning(f"stop failed to set PWM to 0: {e}")
             time.sleep(0.002)
+
+    def slow_stop(self, duration_s: float = 0.6, steps: int = 12):
+        """Gradually ramp motor PWM down to zero for a smoother stop.
+
+        - Uses last applied PWM duty tracked from set_motor_speed.
+        - Does not toggle direction pins; only reduces PWM.
+        """
+        try:
+            steps = max(2, int(steps))
+            duration_s = max(0.1, float(duration_s))
+            d0_l, d0_r = self._last_pwm_duty
+            dt = duration_s / steps
+            for k in range(steps, -1, -1):
+                ratio = k / float(steps)
+                dl = int(d0_l * ratio)
+                dr = int(d0_r * ratio)
+                try:
+                    self.motor_speed_pins[0].pulse_width_percent(dl)
+                    self.motor_speed_pins[1].pulse_width_percent(dr)
+                except Exception:
+                    # Fall back to immediate stop if PWM write fails
+                    try:
+                        self.motor_speed_pins[0].pulse_width_percent(0)
+                        self.motor_speed_pins[1].pulse_width_percent(0)
+                    except Exception:
+                        pass
+                    break
+                time.sleep(dt)
+        finally:
+            # ensure fully stopped
+            try:
+                self.motor_speed_pins[0].pulse_width_percent(0)
+                self.motor_speed_pins[1].pulse_width_percent(0)
+            except Exception:
+                pass
 
     def get_distance(self):
         # Prefer fast, cached reading

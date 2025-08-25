@@ -86,12 +86,12 @@ class AutonomousController:
     def _act_slow(self) -> Status:
         st = self.fusion.update()
         # base slower speed near obstacle; planner will further limit by distance
-        base = 35
+        base = 50  # Increased from 35 - more confident near obstacles
         target = self._planner.limit_by_distance(st.distance_cm, base_speed=base)
-        target = int(max(0, min(100, target * self.get_speed_scale())))
+        target = int(max(20, min(100, target * self.get_speed_scale())))  # Minimum speed 20
         now = time.time()
         dt = max(0.005, now - self._last_tick)
-        emergency = (st.distance_cm or 999.0) <= (self.fusion.obstacle_stop_cm + 4.0)
+        emergency = (st.distance_cm or 999.0) <= (self.fusion.obstacle_stop_cm + 2.0)  # Reduced buffer
         cmd = self._planner.step(target, dt, emergency=emergency)
         self._last_tick = now
         self.px.forward(cmd)
@@ -102,33 +102,67 @@ class AutonomousController:
         st = self.fusion.update()
         if st.line_error is None:
             return Status.FAILURE
-        # proportional steering on error
-        k = 40.0
-        steer = int(max(-30, min(30, k * st.line_error)))
+        
+        # Enhanced steering control for noisy surfaces
+        # Reduce proportional gain and add deadband to minimize jitter
+        error_deadband = 0.1  # Ignore small errors (wood grain noise)
+        
+        if abs(st.line_error) < error_deadband:
+            # Small error - maintain current steering or go straight
+            steer = getattr(self, '_last_stable_steer', 0)
+        else:
+            # Significant error - apply steering correction with reduced gain
+            k = 25.0  # Reduced from 40.0 for smoother response
+            steer = int(max(-25, min(25, k * st.line_error)))  # Reduced max steering angle
+            self._last_stable_steer = steer
+        
         self.px.set_dir_servo_angle(steer)
         self._last_steer_cmd = steer
-        # dynamic base speed by steering, then distance-limit and rate-limit
-        base = max(30, int(60 - abs(steer) * 0.7))
-        base = min(base, 70)
+        
+        # Reduce speed more aggressively with steering to improve stability
+        base = max(35, int(65 - abs(steer) * 1.2))  # More speed reduction with steering
+        base = min(base, 75)  # Lower max base speed for stability
         target = self._planner.limit_by_distance(st.distance_cm, base_speed=base)
-        target = int(max(0, min(100, target * self.get_speed_scale())))
+        target = int(max(15, min(100, target * self.get_speed_scale())))  # Lower minimum speed
         now = time.time()
         dt = max(0.005, now - self._last_tick)
-        emergency = (st.distance_cm or 999.0) <= (self.fusion.obstacle_stop_cm + 4.0)
+        emergency = (st.distance_cm or 999.0) <= (self.fusion.obstacle_stop_cm + 2.0)
         cmd = self._planner.step(target, dt, emergency=emergency)
         self._last_tick = now
         self.px.forward(cmd)
         self._last_speed_cmd = cmd
+        
+        # Log steering decisions for debugging
+        if hasattr(self, '_debug_counter'):
+            self._debug_counter += 1
+        else:
+            self._debug_counter = 1
+            
+        if self._debug_counter % 50 == 0:  # Log every ~1 second at 50Hz
+            self.log.debug(f"Line follow: error={st.line_error:.3f}, steer={steer}, speed={cmd}")
+        
         return Status.SUCCESS
 
     def _act_cruise(self) -> Status:
-        self.px.set_dir_servo_angle(0)
-        self._last_steer_cmd = 0
-        # open area cruising base
+        # Enhanced cruise with gentle steering corrections
+        # Don't just lock to center - allow gentle corrections based on sensor trends
         st = self.fusion.update()
-        base = 55
+        
+        # If we have some line detection but it's weak, make gentle adjustments
+        if st.line_error is not None and abs(st.line_error) > 0.2:
+            # Gentle steering correction during cruise
+            gentle_steer = int(max(-10, min(10, 15.0 * st.line_error)))
+            self.px.set_dir_servo_angle(gentle_steer)
+            self._last_steer_cmd = gentle_steer
+        else:
+            # No strong line signal - go straight
+            self.px.set_dir_servo_angle(0)
+            self._last_steer_cmd = 0
+        
+        # Conservative cruise speed for stability on varied surfaces
+        base = 60  # Reduced from 70 for better stability
         target = self._planner.limit_by_distance(st.distance_cm, base_speed=base)
-        target = int(max(0, min(100, target * self.get_speed_scale())))
+        target = int(max(25, min(100, target * self.get_speed_scale())))  # Higher minimum cruise speed
         now = time.time()
         dt = max(0.005, now - self._last_tick)
         cmd = self._planner.step(target, dt)

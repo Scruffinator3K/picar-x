@@ -41,3 +41,22 @@ class ModeManager:
     def get_manual_command(self) -> ManualCommand:
         with self._lock:
             return ManualCommand(self._cmd.speed, self._cmd.steer)
+
+    def adjust_manual(self, *, speed_delta: Optional[int] = None, steer_delta: Optional[int] = None) -> ManualCommand:
+        """Adjust manual command by deltas and persist (latched control).
+
+        - speed_delta: increment/decrement current speed (-100..100 clamp)
+        - steer_delta: increment/decrement current steering angle (-30..30 clamp)
+        """
+        with self._lock:
+            if speed_delta is not None:
+                try:
+                    self._cmd.speed = max(-100, min(100, int(self._cmd.speed + int(speed_delta))))
+                except Exception:
+                    pass
+            if steer_delta is not None:
+                try:
+                    self._cmd.steer = max(-30, min(30, int(self._cmd.steer + int(steer_delta))))
+                except Exception:
+                    pass
+            return ManualCommand(self._cmd.speed, self._cmd.steer)
